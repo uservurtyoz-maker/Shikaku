@@ -30,6 +30,7 @@ jobs:
           import android.graphics.PixelFormat
           import android.graphics.RectF
           import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
           import android.media.Image
           import android.media.ImageReader
           import android.media.projection.MediaProjection
@@ -61,9 +62,12 @@ jobs:
               private val handler = Handler(Looper.getMainLooper())
               private lateinit var wm: WindowManager
               private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var screenW = 0
+              private var screenH = 0
               private var boardView: OverlayView? = null
               private var menuView: LinearLayout? = null
-              private var menuParams: WindowManager.LayoutParams? = null
               private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
               override fun onBind(intent: Intent?): IBinder? = null
@@ -87,12 +91,30 @@ jobs:
                   }
 
                   val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  virtualDisplay?.release()
+                  reader?.close()
                   projection?.stop()
+                  virtualDisplay = null
+                  reader = null
                   projection = mpm.getMediaProjection(code, data).also {
                       it.registerCallback(object : MediaProjection.Callback() {}, handler)
                   }
+                  setupDisplay()
                   showUi()
                   return START_NOT_STICKY
+              }
+
+              private fun setupDisplay() {
+                  val dm = resources.displayMetrics
+                  screenW = dm.widthPixels
+                  screenH = dm.heightPixels
+                  val r = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
+                  reader = r
+                  virtualDisplay = projection?.createVirtualDisplay(
+                      "shikaku", screenW, screenH, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      r.surface, null, null
+                  )
               }
 
               private fun overlayType(): Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -117,6 +139,8 @@ jobs:
               }
 
               private fun showMenu() {
+                  if (menuView != null) return
+
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.WRAP_CONTENT,
@@ -147,9 +171,10 @@ jobs:
                       }
                   }
 
+                  // Серый фон, а не белый: иначе панель попадает в кадр и сбивает поиск клеток
                   val panel = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.argb(230, 255, 255, 255))
+                      setBackgroundColor(Color.rgb(205, 200, 195))
                       setPadding(16, 8, 16, 16)
                       addView(handle)
                       addView(toggle)
@@ -174,34 +199,38 @@ jobs:
 
                   wm.addView(panel, lp)
                   menuView = panel
-                  menuParams = lp
               }
 
               private fun capture() {
-                  val proj = projection ?: return
+                  val r = reader
+                  if (r == null) {
+                      Toast.makeText(this, "Захват экрана не запущен, нажмите «Запустить захват»", Toast.LENGTH_LONG).show()
+                      return
+                  }
                   boardView?.rects = emptyList()
                   boardView?.invalidate()
+                  // Небольшая пауза, чтобы в кадр не попали уже нарисованные прямоугольники
+                  handler.postDelayed({ grab(r, 0) }, 250)
+              }
 
-                  val dm = resources.displayMetrics
-                  val w = dm.widthPixels
-                  val h = dm.heightPixels
-                  val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-                  val vd = proj.createVirtualDisplay(
-                      "shikaku", w, h, dm.densityDpi,
-                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                      reader.surface, null, null
-                  )
-
-                  reader.setOnImageAvailableListener({ r ->
+              private fun grab(r: ImageReader, tries: Int) {
+                  try {
                       val img = r.acquireLatestImage()
                       if (img != null) {
-                          val bmp = imageToBitmap(img, w, h)
+                          val bmp = imageToBitmap(img, screenW, screenH)
                           img.close()
-                          vd?.release()
-                          r.close()
                           analyze(bmp)
+                          return
                       }
-                  }, handler)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Ошибка захвата: ${e.message}", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  if (tries >= 30) {
+                      Toast.makeText(this, "Нет кадра экрана, попробуйте ещё раз", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  handler.postDelayed({ grab(r, tries + 1) }, 100)
               }
 
               private fun imageToBitmap(img: Image, w: Int, h: Int): Bitmap {
@@ -252,6 +281,8 @@ jobs:
               override fun onDestroy() {
                   menuView?.let { wm.removeView(it) }
                   boardView?.let { wm.removeView(it) }
+                  virtualDisplay?.release()
+                  reader?.close()
                   projection?.stop()
                   super.onDestroy()
               }
