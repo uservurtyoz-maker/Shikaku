@@ -10,6 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Unpack project
+        run: |
+          unzip -q ShikakuOverlay.zip -d unpacked
+          cp -r unpacked/ShikakuOverlay/. .
+          rm -rf unpacked
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
