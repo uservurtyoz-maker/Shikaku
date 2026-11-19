@@ -10,11 +10,253 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unpack project
+      - name: Unpack project and apply fixes
         run: |
           unzip -q ShikakuOverlay.zip -d unpacked
           cp -r unpacked/ShikakuOverlay/. .
           rm -rf unpacked
+          sed -i 's/bmp.height \* 0.22/bmp.height * 0.19/' app/src/main/java/com/example/shikaku/GridDetector.kt
+          cat > app/src/main/java/com/example/shikaku/ShikakuService.kt <<'EOF'
+          package com.example.shikaku
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.RectF
+          import android.hardware.display.DisplayManager
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          class ShikakuService : Service() {
+
+              companion object {
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+                  private const val CHANNEL = "shikaku"
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var projection: MediaProjection? = null
+              private var boardView: OverlayView? = null
+              private var menuView: LinearLayout? = null
+              private var menuParams: WindowManager.LayoutParams? = null
+              private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  createChannel()
+                  ServiceCompat.startForeground(
+                      this, 1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  )
+
+                  val code = intent?.getIntExtra(EXTRA_CODE, 0) ?: 0
+                  val data = intent?.getParcelableExtra<Intent>(EXTRA_DATA)
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection?.stop()
+                  projection = mpm.getMediaProjection(code, data).also {
+                      it.registerCallback(object : MediaProjection.Callback() {}, handler)
+                  }
+                  showUi()
+                  return START_NOT_STICKY
+              }
+
+              private fun overlayType(): Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+              private fun showUi() {
+                  if (boardView != null) return
+
+                  val view = OverlayView(this)
+                  val boardParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  wm.addView(view, boardParams)
+                  boardView = view
+
+                  showMenu()
+              }
+
+              private fun showMenu() {
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 40
+                      y = 300
+                  }
+
+                  val handle = TextView(this).apply {
+                      text = "⠿ Шикаку (тяни)"
+                      textSize = 14f
+                      setPadding(8, 8, 8, 8)
+                  }
+
+                  val toggle = Switch(this).apply {
+                      text = "Подсказка"
+                      setOnCheckedChangeListener { _, on ->
+                          if (on) {
+                              capture()
+                          } else {
+                              boardView?.rects = emptyList()
+                              boardView?.invalidate()
+                          }
+                      }
+                  }
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.argb(230, 255, 255, 255))
+                      setPadding(16, 8, 16, 16)
+                      addView(handle)
+                      addView(toggle)
+                  }
+
+                  var dx = 0f
+                  var dy = 0f
+                  handle.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              dx = e.rawX - lp.x
+                              dy = e.rawY - lp.y
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = (e.rawX - dx).toInt()
+                              lp.y = (e.rawY - dy).toInt()
+                              wm.updateViewLayout(panel, lp)
+                          }
+                      }
+                      true
+                  }
+
+                  wm.addView(panel, lp)
+                  menuView = panel
+                  menuParams = lp
+              }
+
+              private fun capture() {
+                  val proj = projection ?: return
+                  boardView?.rects = emptyList()
+                  boardView?.invalidate()
+
+                  val dm = resources.displayMetrics
+                  val w = dm.widthPixels
+                  val h = dm.heightPixels
+                  val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  val vd = proj.createVirtualDisplay(
+                      "shikaku", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      reader.surface, null, null
+                  )
+
+                  reader.setOnImageAvailableListener({ r ->
+                      val img = r.acquireLatestImage()
+                      if (img != null) {
+                          val bmp = imageToBitmap(img, w, h)
+                          img.close()
+                          vd?.release()
+                          r.close()
+                          analyze(bmp)
+                      }
+                  }, handler)
+              }
+
+              private fun imageToBitmap(img: Image, w: Int, h: Int): Bitmap {
+                  val plane = img.planes[0]
+                  val rowPadding = plane.rowStride - plane.pixelStride * w
+                  val padded = Bitmap.createBitmap(w + rowPadding / plane.pixelStride, h, Bitmap.Config.ARGB_8888)
+                  padded.copyPixelsFromBuffer(plane.buffer)
+                  return Bitmap.createBitmap(padded, 0, 0, w, h)
+              }
+
+              private fun analyze(bmp: Bitmap) {
+                  val image = InputImage.fromBitmap(bmp, 0)
+                  recognizer.process(image)
+                      .addOnSuccessListener { text ->
+                          val a = GridDetector.analyze(bmp, text)
+                          val board = a.board
+                          if (a.ok && board != null) {
+                              boardView?.rects = a.solution.map { s ->
+                                  RectF(
+                                      board.left + s.c0 * a.pw,
+                                      board.top + s.r0 * a.ph,
+                                      board.left + (s.c0 + s.w) * a.pw,
+                                      board.top + (s.r0 + s.h) * a.ph
+                                  )
+                              }
+                              boardView?.invalidate()
+                          }
+                          Toast.makeText(this, a.message, Toast.LENGTH_LONG).show()
+                      }
+                      .addOnFailureListener {
+                          Toast.makeText(this, "Ошибка распознавания: ${it.message}", Toast.LENGTH_LONG).show()
+                      }
+              }
+
+              private fun createChannel() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Шикаку", NotificationManager.IMPORTANCE_LOW)
+                  )
+              }
+
+              private fun notification(): Notification =
+                  NotificationCompat.Builder(this, CHANNEL)
+                      .setContentTitle("Шикаку-подсказка работает")
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .build()
+
+              override fun onDestroy() {
+                  menuView?.let { wm.removeView(it) }
+                  boardView?.let { wm.removeView(it) }
+                  projection?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF
 
       - uses: actions/setup-java@v4
         with:
